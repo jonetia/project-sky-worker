@@ -49,6 +49,35 @@ function chunk(arr, size) {
   return out;
 }
 
+/**
+ * Real TLE text lines, fetched directly from CelesTrak rather than
+ * reconstructed by hand -- generating fixed-width TLE text ourselves
+ * risks subtle, hard-to-catch formatting errors that would silently
+ * corrupt propagation. Matched to objects by NORAD ID *parsed* from the
+ * text (a safe read of a fixed 5-digit field), not by response order.
+ * Same function already proven correct on the 'stations' edge function.
+ */
+async function fetchTleLinesByNorad(group) {
+  const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=tle`;
+  const resp = await fetch(url, { headers: { "User-Agent": "project-sky-worker/0.1" } });
+  if (!resp.ok) {
+    console.error(`[${group}] TLE fetch failed: HTTP ${resp.status} -- proceeding without lines`);
+    return new Map();
+  }
+
+  const text = await resp.text();
+  const lines = text.split("\n").map((l) => l.trimEnd()).filter((l) => l.length > 0);
+  const result = new Map();
+
+  for (let i = 0; i < lines.length - 1; i++) {
+    if (lines[i].startsWith("1 ") && lines[i + 1]?.startsWith("2 ")) {
+      const noradId = lines[i].substring(2, 7).trim();
+      result.set(noradId, { line1: lines[i], line2: lines[i + 1] });
+    }
+  }
+  return result;
+}
+
 async function ingestGroup(supabase, group) {
   const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=json`;
   const resp = await fetch(url, {
@@ -63,6 +92,9 @@ async function ingestGroup(supabase, group) {
 
   const records = await resp.json();
   console.log(`[${group}] fetched ${records.length} records`);
+
+  const tleLines = await fetchTleLinesByNorad(group);
+  console.log(`[${group}] fetched ${tleLines.size} TLE line pairs`);
 
   let objectsUpserted = 0;
   let identifiersInserted = 0;
@@ -142,10 +174,13 @@ async function ingestGroup(supabase, group) {
       const objectId = idByNorad.get(String(r.NORAD_CAT_ID));
       if (!objectId) return [];
       const { perigeeKm, apogeeKm } = computePerigeeApogeeKm(r.MEAN_MOTION, r.ECCENTRICITY);
+      const tle = tleLines.get(String(r.NORAD_CAT_ID));
       return [{
         object_id: objectId,
         epoch: normalizeEpoch(r.EPOCH),
         source: "celestrak",
+        line1: tle?.line1 ?? null,
+        line2: tle?.line2 ?? null,
         mean_motion: r.MEAN_MOTION,
         eccentricity: r.ECCENTRICITY,
         inclination_deg: r.INCLINATION,
