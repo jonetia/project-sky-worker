@@ -49,6 +49,10 @@ function chunk(arr, size) {
   return out;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
  * Real TLE text lines, fetched directly from CelesTrak rather than
  * reconstructed by hand -- generating fixed-width TLE text ourselves
@@ -56,6 +60,12 @@ function chunk(arr, size) {
  * corrupt propagation. Matched to objects by NORAD ID *parsed* from the
  * text (a safe read of a fixed 5-digit field), not by response order.
  * Same function already proven correct on the 'stations' edge function.
+ *
+ * A short delay before this call (see caller) avoids back-to-back large
+ * requests to CelesTrak from the same source -- confirmed by testing:
+ * fetching TLE format immediately after JSON format for the 'active'
+ * group returned HTTP 403, while the JSON fetch itself succeeded. Likely
+ * anti-abuse rate limiting reacting to burst traffic, not a real block.
  */
 async function fetchTleLinesByNorad(group) {
   const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=tle`;
@@ -93,7 +103,10 @@ async function ingestGroup(supabase, group) {
   const records = await resp.json();
   console.log(`[${group}] fetched ${records.length} records`);
 
-  const tleLines = await fetchTleLinesByNorad(group);
+  const tleLines = await (async () => {
+    await sleep(4000); // let CelesTrak see this as two separate requests, not a burst
+    return fetchTleLinesByNorad(group);
+  })();
   console.log(`[${group}] fetched ${tleLines.size} TLE line pairs`);
 
   let objectsUpserted = 0;
