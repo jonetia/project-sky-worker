@@ -20,6 +20,7 @@ const CELESTRAK_BASE = "https://celestrak.org/NORAD/elements/gp.php";
 const EARTH_RADIUS_KM = 6378.137; // WGS84 equatorial radius
 const MU_EARTH_KM3_S2 = 398600.4418; // Earth's standard gravitational parameter
 const BATCH_SIZE = 1000;
+const FETCH_TIMEOUT_MS = 20000;
 
 // Comma-separated list, e.g. "active,stations". Widening coverage later
 // is a Railway environment variable change, not a code change.
@@ -66,11 +67,28 @@ function sleep(ms) {
  * fetching TLE format immediately after JSON format for the 'active'
  * group returned HTTP 403, while the JSON fetch itself succeeded. Likely
  * anti-abuse rate limiting reacting to burst traffic, not a real block.
+ *
+ * 2026-09-13: the fixed 4s gap alone stopped being enough -- 403s started
+ * recurring, and one run hung outright with no timeout set at all. Added
+ * an explicit fetch timeout (a hang should fail fast and loudly, not
+ * stall the whole job for minutes) and a real retry-with-backoff on 403
+ * specifically, since that status is the rate-limit signal this comment
+ * already correctly identified, not a hard block.
  */
-async function fetchTleLinesByNorad(group) {
+async function fetchTleLinesByNorad(group, attempt = 1) {
   const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=tle`;
-  const resp = await fetch(url, { headers: { "User-Agent": "project-sky-worker/0.1" } });
+  const resp = await fetch(url, {
+    headers: { "User-Agent": "project-sky-worker/0.1" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+
   if (!resp.ok) {
+    if (resp.status === 403 && attempt < 3) {
+      const backoffMs = attempt * 8000; // 8s, then 16s
+      console.error(`[${group}] TLE fetch got HTTP 403, retrying in ${backoffMs}ms (attempt ${attempt + 1}/3)`);
+      await sleep(backoffMs);
+      return fetchTleLinesByNorad(group, attempt + 1);
+    }
     console.error(`[${group}] TLE fetch failed: HTTP ${resp.status} -- proceeding without lines`);
     return new Map();
   }
@@ -92,6 +110,7 @@ async function ingestGroup(supabase, group) {
   const url = `${CELESTRAK_BASE}?GROUP=${group}&FORMAT=json`;
   const resp = await fetch(url, {
     headers: { "User-Agent": "project-sky-worker/0.1 (contact: tim, becoming100/sky POC)" },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
 
   if (!resp.ok) {
@@ -104,7 +123,7 @@ async function ingestGroup(supabase, group) {
   console.log(`[${group}] fetched ${records.length} records`);
 
   const tleLines = await (async () => {
-    await sleep(4000); // let CelesTrak see this as two separate requests, not a burst
+    await sleep(8000); // widened from 4000 -- see fetchTleLinesByNorad comment, 2026-09-13
     return fetchTleLinesByNorad(group);
   })();
   console.log(`[${group}] fetched ${tleLines.size} TLE line pairs`);
@@ -221,7 +240,18 @@ async function ingestGroup(supabase, group) {
     );
   }
 
-  return { group, recordCount: records.length, objectsUpserted, identifiersInserted, elementsWritten };
+  return {
+    group,
+    recordCount: records.length,
+    objectsUpserted,
+    identifiersInserted,
+    elementsWritten,
+    tleLinesFetched: tleLines.size,
+    // 2026-09-13: makes a bad TLE fetch visible in the completion log itself
+    // instead of only a console.error line -- this is what let the 18:04
+    // run's near-total TLE shortfall go unnoticed for 6+ hours.
+    tleShortfall: tleLines.size < records.length * 0.5,
+  };
 }
 
 async function main() {
