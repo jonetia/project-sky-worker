@@ -41,5 +41,23 @@ npm install
 npm start
 ```
 
-Exits 0 on success, 1 if any group failed. Designed to run to completion
-and exit -- not a long-running server.
+Exits 0 on success, 1 on failure. Designed to run to completion and exit.
+
+## Reliability and security
+
+- JSON/OMM elements are the source of truth. The worker does not fetch,
+  derive, or require TLE text. Existing TLE columns are left untouched.
+- Each provider group is fetched once, with a 60-second deadline. Any non-200
+  response stops the entire run; no redirects or provider retries are followed.
+- Database writes use batches of 100. Statement timeouts split idempotent
+  writes into smaller requests; retries of singleton writes are bounded.
+- Identifier lookups paginate and fail closed on errors. Identifier inserts
+  are not blindly retried. Keep one worker replica; concurrent writers require
+  a database uniqueness constraint for active identifiers.
+- A 15-minute process deadline prevents hung requests blocking future jobs.
+- Node 24 and the Supabase dependency are pinned. Use `npm ci --ignore-scripts`.
+- `npm test` uses mocked services and never reads production credentials.
+- Railway builds run the tests; failing tests prevent deployment.
+- Server credentials belong only in Railway variables. `SUPABASE_SECRET_KEY`
+  is supported, with `SUPABASE_SERVICE_ROLE_KEY` retained as a fallback.
+  Both are privileged; neither belongs in Git or a browser client.

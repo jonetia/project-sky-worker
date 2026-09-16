@@ -5,12 +5,13 @@
   "type": "module",
   "description": "Orbital catalogue ingestion worker for Project Sky. Runs on a schedule (Railway cron), not always-on, and not an edge function -- exists specifically to handle catalogue-scale CelesTrak groups that exceed edge function CPU budgets.",
   "engines": {
-    "node": ">=22"
+    "node": "24.x"
   },
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "test": "node --test"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.45.0"
+    "@supabase/supabase-js": "2.115.0"
   }
 }
