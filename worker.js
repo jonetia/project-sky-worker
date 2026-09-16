@@ -2,6 +2,7 @@
 const CELESTRAK_BASE = "https://celestrak.org/NORAD/elements/gp.php";
 const BATCH_SIZE = 100;
 const PAGE_SIZE = 500;
+const LOOKUP_BATCH_SIZE = 25;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 export function normalizeEpoch(epoch) {
@@ -50,25 +51,45 @@ export async function writeIdempotent(rows, write, label, pause = sleep, attempt
   throw databaseError(label, error);
 }
 
-export async function readIdentifiers(supabase, objectIds) {
-  const rows = [];
-  // Keyset pagination also works when the server caps pages below PAGE_SIZE.
-  let lastId;
-  for (;;) {
-    let query = supabase.from("object_identifiers")
-      .select("id,object_id,identifier_type,identifier_value")
-      .in("object_id", objectIds).is("valid_to", null)
-      .order("id").limit(PAGE_SIZE);
-    if (lastId) query = query.gt("id", lastId);
-    const { data, error } = await query;
-    if (error) throw databaseError("identifier lookup", error);
-    if (!Array.isArray(data)) throw new Error("Identifier lookup returned no data");
-    if (!data.length) return rows;
-    const nextId = data.at(-1).id;
-    if (!nextId || nextId === lastId) throw new Error("Identifier pagination did not advance");
-    rows.push(...data);
-    lastId = nextId;
+function transientReadError(error) {
+  return ["57014", "40001", "40P01", "PGRST002"].includes(error?.code)
+    || /timeout|timed out|connection.*(?:terminated|closed)|schema cache/i.test(error?.message || "");
+}
+
+async function readIdentifierPage(buildQuery, pause, attempt = 0) {
+  const { data, error } = await buildQuery();
+  if (!error) return data;
+  if (transientReadError(error) && attempt < 2) {
+    await pause(1000 * (attempt + 1));
+    return readIdentifierPage(buildQuery, pause, attempt + 1);
   }
+  throw databaseError("identifier lookup", error);
+}
+
+export async function readIdentifiers(supabase, objectIds, pause = sleep) {
+  const rows = [];
+  for (let offset = 0; offset < objectIds.length; offset += LOOKUP_BATCH_SIZE) {
+    const ids = objectIds.slice(offset, offset + LOOKUP_BATCH_SIZE);
+    // Keyset pagination also works when the server caps pages below PAGE_SIZE.
+    let lastId;
+    for (;;) {
+      const data = await readIdentifierPage(() => {
+        let query = supabase.from("object_identifiers")
+          .select("id,object_id,identifier_type,identifier_value")
+          .in("object_id", ids).is("valid_to", null)
+          .order("id").limit(PAGE_SIZE);
+        if (lastId) query = query.gt("id", lastId);
+        return query;
+      }, pause);
+      if (!Array.isArray(data)) throw new Error("Identifier lookup returned no data");
+      if (!data.length) break;
+      const nextId = data.at(-1).id;
+      if (!nextId || nextId === lastId) throw new Error("Identifier pagination did not advance");
+      rows.push(...data);
+      lastId = nextId;
+    }
+  }
+  return rows;
 }
 
 export async function ingestGroup(supabase, group, { fetchFn = fetch, pause = sleep, log = console.log } = {}) {
@@ -96,7 +117,7 @@ export async function ingestGroup(supabase, group, { fetchFn = fetch, pause = sl
     if (batch.some(r => !idByNorad.has(String(r.NORAD_CAT_ID)))) throw new Error("Incomplete sky_objects response; stopped before dependent writes");
     objectsUpserted += objects.length;
 
-    const existing = await readIdentifiers(supabase, [...idByNorad.values()]);
+    const existing = await readIdentifiers(supabase, [...idByNorad.values()], pause);
     const key = r => JSON.stringify([r.object_id, r.identifier_type, r.identifier_value]);
     const keys = new Set(existing.map(key));
     const identifiers = batch.flatMap(r => {
